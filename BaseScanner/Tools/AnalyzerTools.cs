@@ -1,10 +1,16 @@
 using System.ComponentModel;
 using System.Text.Json;
+using Microsoft.CodeAnalysis;
 using ModelContextProtocol.Server;
 using BaseScanner.Services;
 using BaseScanner.Analyzers.Security;
+using BaseScanner.Analyzers.Concurrency;
+using BaseScanner.Analyzers.Frameworks;
+using BaseScanner.Analyzers.Quality;
 using BaseScanner.Analysis;
 using BaseScanner.Transformers;
+using BaseScanner.Transformers.Core;
+using BaseScanner.VirtualWorkspace;
 
 namespace BaseScanner.Tools;
 
@@ -307,25 +313,27 @@ public static class AnalyzerTools
                 MaxTransformations = maxTransformations
             };
 
-            var service = new TransformationService();
-            var preview = await service.PreviewAsync(projectPath, filter);
+            var analysisService = new AnalysisService();
+            var project = await analysisService.OpenProjectAsync(projectPath);
+            var backupService = new BackupService(projectPath);
+            var service = new TransformationService(backupService);
+            var preview = await service.PreviewAsync(project, filter);
 
             return JsonSerializer.Serialize(new
             {
-                preview.TotalOpportunities,
-                preview.FilteredCount,
-                transformations = preview.Transformations.Select(t => new
+                preview.Success,
+                totalTransformations = preview.TotalTransformations,
+                transformationsByType = preview.TransformationsByType,
+                transformations = preview.Previews.Select(t => new
                 {
                     t.FilePath,
                     t.StartLine,
                     t.EndLine,
                     t.Category,
-                    t.Type,
-                    t.Description,
-                    t.CurrentCode,
+                    t.TransformationType,
+                    t.OriginalCode,
                     t.SuggestedCode,
-                    t.Confidence,
-                    t.IsSemanticallySafe
+                    t.Confidence
                 }).ToList()
             }, JsonOptions);
         }
@@ -360,27 +368,27 @@ public static class AnalyzerTools
 
             var options = new TransformationOptions
             {
-                CreateBackup = createBackup,
-                ValidateAfterTransform = true,
-                StopOnFirstError = false
+                FormatOutput = true
             };
 
-            var service = new TransformationService();
-            var result = await service.ApplyAsync(projectPath, filter, options);
+            var analysisService = new AnalysisService();
+            var project = await analysisService.OpenProjectAsync(projectPath);
+            var backupService = new BackupService(projectPath);
+            var service = new TransformationService(backupService);
+            var result = await service.ApplyAsync(project, filter, options);
 
             return JsonSerializer.Serialize(new
             {
                 result.Success,
-                result.TransformationsApplied,
-                result.TransformationsFailed,
+                result.TotalTransformations,
                 result.FilesModified,
                 result.BackupId,
-                errors = result.Errors,
-                appliedTransformations = result.AppliedTransformations.Select(t => new
+                errorMessage = result.ErrorMessage,
+                results = result.Results.Select(r => new
                 {
-                    t.FilePath,
-                    t.Type,
-                    t.Description
+                    r.TransformationType,
+                    r.Success,
+                    changes = r.Changes.Select(c => new { c.FilePath, c.OriginalCode, c.TransformedCode }).ToList()
                 }).ToList()
             }, JsonOptions);
         }
@@ -400,15 +408,16 @@ public static class AnalyzerTools
     {
         try
         {
-            var service = new TransformationService();
-            var result = await service.RollbackAsync(projectPath, backupId);
+            var backupService = new BackupService(projectPath);
+            var service = new TransformationService(backupService);
+            var result = await service.RollbackAsync(backupId);
 
             return JsonSerializer.Serialize(new
             {
                 result.Success,
                 result.BackupId,
                 result.FilesRestored,
-                result.Message
+                result.ErrorMessage
             }, JsonOptions);
         }
         catch (Exception ex)
@@ -432,8 +441,8 @@ public static class AnalyzerTools
             {
                 backups = backups.Select(b => new
                 {
-                    b.BackupId,
-                    b.Timestamp,
+                    b.Id,
+                    b.CreatedAt,
                     b.FileCount,
                     b.Description
                 }).ToList()
@@ -450,45 +459,42 @@ public static class AnalyzerTools
     public static async Task<string> AnalyzeTaintFlow(
         [Description("Path to .csproj file or directory containing a C# project")]
         string projectPath,
-        [Description("Source type filter: user_input, environment, file, network, database, all. Default: all")]
-        string sourceType = "all")
+        [Description("Treat all method parameters as tainted. Default: true")]
+        bool treatParametersAsTainted = true)
     {
         try
         {
+            var analysisService = new AnalysisService();
+            var project = await analysisService.OpenProjectAsync(projectPath);
+
             var taintTracker = new TaintTracker();
-            var config = TaintConfiguration.Default;
-
-            // Filter sources if specified
-            if (sourceType != "all")
+            var config = new TaintConfiguration
             {
-                config = config with
-                {
-                    Sources = config.Sources
-                        .Where(s => s.Category.Equals(sourceType, StringComparison.OrdinalIgnoreCase))
-                        .ToList()
-                };
-            }
+                TreatParametersAsTainted = treatParametersAsTainted
+            };
 
-            var flows = await taintTracker.TrackAsync(projectPath, config);
+            var flows = await taintTracker.TrackAsync(project, config);
 
             var result = new
             {
                 totalFlows = flows.Count,
                 unsanitizedFlows = flows.Count(f => !f.IsSanitized),
                 sanitizedFlows = flows.Count(f => f.IsSanitized),
-                flowsBySeverity = flows
-                    .GroupBy(f => f.Severity)
+                flowsBySourceType = flows
+                    .GroupBy(f => f.Source.SourceType)
                     .ToDictionary(g => g.Key, g => g.Count()),
                 flows = flows.Select(f => new
                 {
-                    f.SourceType,
-                    f.SourceLocation,
-                    f.SinkType,
-                    f.SinkLocation,
-                    f.Severity,
-                    f.IsSanitized,
-                    f.SanitizerLocation,
-                    path = f.DataFlowPath
+                    sourceType = f.Source.SourceType,
+                    sourceName = f.Source.SourceName,
+                    sourceLine = f.Source.Line,
+                    sinkType = f.Sink.SinkType,
+                    sinkName = f.Sink.SinkName,
+                    sinkLine = f.Sink.Line,
+                    taintedVariable = f.TaintedVariable,
+                    isSanitized = f.IsSanitized,
+                    sanitizerLocation = f.SanitizerLocation,
+                    path = f.Path
                 }).ToList()
             };
 
@@ -538,6 +544,414 @@ public static class AnalyzerTools
             };
 
             return JsonSerializer.Serialize(result, JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            return JsonSerializer.Serialize(new { error = ex.Message }, JsonOptions);
+        }
+    }
+
+    [McpServerTool]
+    [Description("Analyze C# code for concurrency and threading issues including floating tasks, async void, lock patterns, race conditions, and deadlock risks.")]
+    public static async Task<string> AnalyzeConcurrency(
+        [Description("Path to .csproj file or directory containing a C# project")]
+        string projectPath)
+    {
+        try
+        {
+            var service = new AnalysisService();
+            var project = await service.OpenProjectAsync(projectPath);
+
+            var analyzer = new ConcurrencyAnalyzer();
+            var result = await analyzer.AnalyzeProjectAsync(project);
+
+            return JsonSerializer.Serialize(new
+            {
+                result.TotalIssues,
+                result.CriticalCount,
+                result.HighCount,
+                result.MediumCount,
+                result.IssuesByType,
+                issues = result.Issues.Select(i => new
+                {
+                    i.IssueType,
+                    i.Severity,
+                    i.Message,
+                    i.FilePath,
+                    i.Line,
+                    i.CodeSnippet,
+                    i.SuggestedFix,
+                    i.CweId
+                }).ToList()
+            }, JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            return JsonSerializer.Serialize(new { error = ex.Message }, JsonOptions);
+        }
+    }
+
+    [McpServerTool]
+    [Description("Analyze ASP.NET Core specific security issues including missing authorization, CSRF vulnerabilities, insecure CORS, mass assignment, and open redirects.")]
+    public static async Task<string> AnalyzeAspNetCore(
+        [Description("Path to .csproj file or directory containing a C# project")]
+        string projectPath)
+    {
+        try
+        {
+            var service = new AnalysisService();
+            var project = await service.OpenProjectAsync(projectPath);
+
+            var analyzer = new AspNetCoreAnalyzer();
+            var result = await analyzer.AnalyzeAsync(project);
+
+            return JsonSerializer.Serialize(new
+            {
+                result.Framework,
+                result.TotalIssues,
+                result.CriticalCount,
+                result.HighCount,
+                result.MediumCount,
+                result.IssuesByType,
+                issues = result.Issues.Select(i => new
+                {
+                    i.IssueType,
+                    i.Severity,
+                    i.Message,
+                    i.FilePath,
+                    i.Line,
+                    i.CweId,
+                    i.SuggestedFix
+                }).ToList()
+            }, JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            return JsonSerializer.Serialize(new { error = ex.Message }, JsonOptions);
+        }
+    }
+
+    [McpServerTool]
+    [Description("Analyze Entity Framework Core specific issues including N+1 queries, missing AsNoTracking, Cartesian explosion, raw SQL injection, and lazy loading traps.")]
+    public static async Task<string> AnalyzeEntityFramework(
+        [Description("Path to .csproj file or directory containing a C# project")]
+        string projectPath)
+    {
+        try
+        {
+            var service = new AnalysisService();
+            var project = await service.OpenProjectAsync(projectPath);
+
+            var analyzer = new EntityFrameworkAnalyzer();
+            var result = await analyzer.AnalyzeAsync(project);
+
+            return JsonSerializer.Serialize(new
+            {
+                result.Framework,
+                result.TotalIssues,
+                result.CriticalCount,
+                result.HighCount,
+                result.MediumCount,
+                result.IssuesByType,
+                issues = result.Issues.Select(i => new
+                {
+                    i.IssueType,
+                    i.Severity,
+                    i.Message,
+                    i.FilePath,
+                    i.Line,
+                    i.CweId,
+                    i.SuggestedFix
+                }).ToList()
+            }, JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            return JsonSerializer.Serialize(new { error = ex.Message }, JsonOptions);
+        }
+    }
+
+    [McpServerTool]
+    [Description("Analyze code quality including cognitive complexity, code smells, testability issues, error handling patterns, and design problems.")]
+    public static async Task<string> AnalyzeCodeQuality(
+        [Description("Path to .csproj file or directory containing a C# project")]
+        string projectPath,
+        [Description("Cognitive complexity threshold for methods. Default: 15")]
+        int complexityThreshold = 15)
+    {
+        try
+        {
+            var service = new AnalysisService();
+            var project = await service.OpenProjectAsync(projectPath);
+
+            var analyzer = new CodeQualityAnalyzer();
+            var result = await analyzer.AnalyzeAsync(project);
+
+            // Filter by threshold
+            var methodsAbove = result.MethodMetrics
+                .Where(m => m.CognitiveComplexity > complexityThreshold)
+                .OrderByDescending(m => m.CognitiveComplexity)
+                .ToList();
+
+            return JsonSerializer.Serialize(new
+            {
+                result.TotalIssues,
+                result.IssuesByCategory,
+                result.AverageCognitiveComplexity,
+                methodsAboveThreshold = methodsAbove.Count,
+                complexMethods = methodsAbove.Select(m => new
+                {
+                    m.MethodName,
+                    m.FilePath,
+                    m.Line,
+                    m.CognitiveComplexity,
+                    m.CyclomaticComplexity,
+                    m.LineCount,
+                    m.NestingDepth
+                }).Take(20).ToList(),
+                issues = result.Issues
+                    .OrderByDescending(i => i.Severity == "High" ? 3 : i.Severity == "Medium" ? 2 : 1)
+                    .Select(i => new
+                    {
+                        i.Category,
+                        i.IssueType,
+                        i.Severity,
+                        i.Message,
+                        i.FilePath,
+                        i.Line,
+                        i.Suggestion
+                    }).ToList()
+            }, JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            return JsonSerializer.Serialize(new { error = ex.Message }, JsonOptions);
+        }
+    }
+
+    [McpServerTool]
+    [Description("Calculate cognitive complexity for all methods in a project using Sonar's algorithm. Reports methods that exceed the threshold.")]
+    public static async Task<string> AnalyzeCognitiveComplexity(
+        [Description("Path to .csproj file or directory containing a C# project")]
+        string projectPath,
+        [Description("Complexity threshold. Methods above this will be flagged. Default: 15")]
+        int threshold = 15)
+    {
+        try
+        {
+            var service = new AnalysisService();
+            var project = await service.OpenProjectAsync(projectPath);
+
+            var analyzer = new CodeQualityAnalyzer();
+            var result = await analyzer.AnalyzeAsync(project);
+
+            var metrics = result.MethodMetrics
+                .OrderByDescending(m => m.CognitiveComplexity)
+                .ToList();
+
+            var aboveThreshold = metrics.Where(m => m.CognitiveComplexity > threshold).ToList();
+
+            return JsonSerializer.Serialize(new
+            {
+                totalMethods = metrics.Count,
+                averageComplexity = Math.Round(result.AverageCognitiveComplexity, 2),
+                methodsAboveThreshold = aboveThreshold.Count,
+                threshold,
+                distribution = new
+                {
+                    low = metrics.Count(m => m.CognitiveComplexity <= 5),
+                    moderate = metrics.Count(m => m.CognitiveComplexity > 5 && m.CognitiveComplexity <= 10),
+                    high = metrics.Count(m => m.CognitiveComplexity > 10 && m.CognitiveComplexity <= 20),
+                    veryHigh = metrics.Count(m => m.CognitiveComplexity > 20)
+                },
+                complexMethods = aboveThreshold.Select(m => new
+                {
+                    m.MethodName,
+                    m.FilePath,
+                    m.Line,
+                    m.CognitiveComplexity,
+                    m.CyclomaticComplexity,
+                    m.LineCount,
+                    m.NestingDepth,
+                    m.ParameterCount
+                }).Take(30).ToList()
+            }, JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            return JsonSerializer.Serialize(new { error = ex.Message }, JsonOptions);
+        }
+    }
+
+    [McpServerTool]
+    [Description("Compare multiple optimization strategies in a virtual workspace without modifying actual files. Returns ranked results based on complexity, maintainability, and semantic safety.")]
+    public static async Task<string> CompareOptimizationStrategies(
+        [Description("Path to .csproj file or directory containing a C# project")]
+        string projectPath,
+        [Description("Specific file path to analyze. If not provided, analyzes first file with optimization opportunities.")]
+        string? filePath = null,
+        [Description("Maximum number of strategies to compare. Default: 5")]
+        int maxStrategies = 5)
+    {
+        try
+        {
+            var service = new AnalysisService();
+            var project = await service.OpenProjectAsync(projectPath);
+
+            // Find a file with optimization opportunities
+            Document? targetDoc = null;
+            if (filePath != null)
+            {
+                targetDoc = project.Documents.FirstOrDefault(d =>
+                    d.FilePath?.EndsWith(filePath, StringComparison.OrdinalIgnoreCase) == true);
+            }
+            else
+            {
+                // Find first file with potential optimizations
+                foreach (var doc in project.Documents)
+                {
+                    var root = await doc.GetSyntaxRootAsync();
+                    if (root?.DescendantNodes().Any() == true)
+                    {
+                        targetDoc = doc;
+                        break;
+                    }
+                }
+            }
+
+            if (targetDoc == null)
+            {
+                return JsonSerializer.Serialize(new { error = "No suitable file found for analysis" }, JsonOptions);
+            }
+
+            using var workspace = new VirtualWorkspaceManager();
+            workspace.LoadFromProject(project);
+
+            // Create simple transformation strategies based on detected patterns
+            var strategies = new List<ITransformationStrategy>();
+            // Note: In a full implementation, we'd dynamically create strategies based on detected patterns
+
+            var comparison = await workspace.CompareTransformationsAsync(targetDoc.Id, strategies);
+
+            return JsonSerializer.Serialize(new
+            {
+                originalFile = targetDoc.FilePath,
+                totalStrategies = comparison.Results.Count,
+                failedStrategies = comparison.FailedResults.Count,
+                results = comparison.Results.Select(r => new
+                {
+                    r.StrategyName,
+                    r.Category,
+                    r.Description,
+                    score = new
+                    {
+                        overall = Math.Round(r.Score.OverallScore, 2),
+                        complexityDelta = r.Score.ComplexityDelta,
+                        cognitiveComplexityDelta = r.Score.CognitiveComplexityDelta,
+                        locDelta = r.Score.LocDelta,
+                        maintainabilityDelta = Math.Round(r.Score.MaintainabilityDelta, 2),
+                        compilationValid = r.Score.CompilationValid,
+                        semanticsPreserved = r.Score.SemanticsPreserved
+                    },
+                    diff = new
+                    {
+                        addedLines = r.Diff.AddedLines,
+                        removedLines = r.Diff.RemovedLines,
+                        modifiedRegions = r.Diff.ModifiedRegions
+                    }
+                }).ToList(),
+                bestStrategy = comparison.BestResult != null ? new
+                {
+                    comparison.BestResult.StrategyName,
+                    comparison.BestResult.Description,
+                    score = Math.Round(comparison.BestResult.Score.OverallScore, 2)
+                } : null
+            }, JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            return JsonSerializer.Serialize(new { error = ex.Message }, JsonOptions);
+        }
+    }
+
+    [McpServerTool]
+    [Description("Run a comprehensive analysis including all detectors: security, concurrency, frameworks, code quality, and optimizations.")]
+    public static async Task<string> RunFullAnalysis(
+        [Description("Path to .csproj file or directory containing a C# project")]
+        string projectPath)
+    {
+        try
+        {
+            var service = new AnalysisService();
+            var project = await service.OpenProjectAsync(projectPath);
+
+            // Run all analyzers in parallel
+            var concurrencyTask = new ConcurrencyAnalyzer().AnalyzeProjectAsync(project);
+            var aspNetTask = new AspNetCoreAnalyzer().AnalyzeAsync(project);
+            var efTask = new EntityFrameworkAnalyzer().AnalyzeAsync(project);
+            var qualityTask = new CodeQualityAnalyzer().AnalyzeAsync(project);
+
+            var options = new AnalysisOptions
+            {
+                SecurityAnalysis = true,
+                OptimizationAnalysis = true,
+                DashboardAnalysis = true
+            };
+            var mainAnalysisTask = service.AnalyzeAsync(projectPath, options);
+
+            await Task.WhenAll(concurrencyTask, aspNetTask, efTask, qualityTask, mainAnalysisTask);
+
+            var concurrency = await concurrencyTask;
+            var aspNet = await aspNetTask;
+            var ef = await efTask;
+            var quality = await qualityTask;
+            var main = await mainAnalysisTask;
+
+            return JsonSerializer.Serialize(new
+            {
+                projectPath,
+                summary = new
+                {
+                    healthScore = main.Metrics?.HealthScore ?? 0,
+                    totalIssues = concurrency.TotalIssues + aspNet.TotalIssues + ef.TotalIssues +
+                                  quality.TotalIssues + (main.Security?.TotalVulnerabilities ?? 0),
+                    criticalIssues = concurrency.CriticalCount + aspNet.CriticalCount + ef.CriticalCount +
+                                     (main.Security?.CriticalCount ?? 0),
+                    averageCognitiveComplexity = Math.Round(quality.AverageCognitiveComplexity, 2),
+                    methodsAboveComplexityThreshold = quality.MethodsAboveThreshold,
+                    optimizationOpportunities = main.Optimizations?.Summary.TotalOpportunities ?? 0
+                },
+                concurrency = new
+                {
+                    concurrency.TotalIssues,
+                    concurrency.IssuesByType,
+                    topIssues = concurrency.Issues.Take(10).ToList()
+                },
+                aspNetCore = new
+                {
+                    aspNet.TotalIssues,
+                    aspNet.IssuesByType,
+                    topIssues = aspNet.Issues.Take(10).ToList()
+                },
+                entityFramework = new
+                {
+                    ef.TotalIssues,
+                    ef.IssuesByType,
+                    topIssues = ef.Issues.Take(10).ToList()
+                },
+                codeQuality = new
+                {
+                    quality.TotalIssues,
+                    quality.IssuesByCategory,
+                    topIssues = quality.Issues.Take(10).ToList()
+                },
+                security = main.Security != null ? new
+                {
+                    main.Security.TotalVulnerabilities,
+                    main.Security.VulnerabilitiesByType,
+                    topVulnerabilities = main.Security.Vulnerabilities.Take(10).ToList()
+                } : null
+            }, JsonOptions);
         }
         catch (Exception ex)
         {

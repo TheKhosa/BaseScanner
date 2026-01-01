@@ -128,6 +128,7 @@ public class SecurityAnalyzer
         return new CodeContext
         {
             ProjectPath = project.FilePath ?? "",
+            BuiltAt = DateTime.UtcNow,
             CallGraph = callGraph
         };
     }

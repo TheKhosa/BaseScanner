@@ -97,6 +97,48 @@ public class AnalysisService
         }
     }
 
+    /// <summary>
+    /// Open a project for analysis without running full analysis.
+    /// Useful for custom analyzers that need direct access to the Roslyn project.
+    /// </summary>
+    public async Task<Project> OpenProjectAsync(string projectPath)
+    {
+        EnsureMSBuildRegistered();
+
+        var resolvedPath = ResolveProjectPath(projectPath);
+        var workspace = MSBuildWorkspace.Create();
+        var project = await workspace.OpenProjectAsync(resolvedPath);
+
+        return project;
+    }
+
+    private static string ResolveProjectPath(string projectPath)
+    {
+        if (File.Exists(projectPath) && projectPath.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
+        {
+            return projectPath;
+        }
+
+        if (Directory.Exists(projectPath))
+        {
+            var csprojFiles = Directory.GetFiles(projectPath, "*.csproj");
+            if (csprojFiles.Length == 1)
+            {
+                return csprojFiles[0];
+            }
+            else if (csprojFiles.Length > 1)
+            {
+                throw new ArgumentException($"Multiple .csproj files found in directory. Please specify one: {string.Join(", ", csprojFiles.Select(Path.GetFileName))}");
+            }
+            else
+            {
+                throw new FileNotFoundException("No .csproj file found in directory: " + projectPath);
+            }
+        }
+
+        throw new FileNotFoundException("Project path not found: " + projectPath);
+    }
+
     public async Task<AnalysisResult> AnalyzeAsync(string projectPath, AnalysisOptions options)
     {
         EnsureMSBuildRegistered();

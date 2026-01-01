@@ -494,3 +494,119 @@ public record OptimizationItem
     /// </summary>
     public List<string> Risks { get; init; } = [];
 }
+
+// Concurrency analysis result types
+
+public record ConcurrencyAnalysisResultDto
+{
+    public int TotalIssues { get; init; }
+    public int CriticalCount { get; init; }
+    public int HighCount { get; init; }
+    public int MediumCount { get; init; }
+    public List<ConcurrencyIssueDto> Issues { get; init; } = [];
+    public Dictionary<string, int> IssuesByType { get; init; } = [];
+}
+
+public record ConcurrencyIssueDto
+{
+    public required string IssueType { get; init; }
+    public required string Severity { get; init; }
+    public required string Message { get; init; }
+    public required string FilePath { get; init; }
+    public required int Line { get; init; }
+    public required int EndLine { get; init; }
+    public string? CodeSnippet { get; init; }
+    public string? SuggestedFix { get; init; }
+    public string? CweId { get; init; }
+}
+
+// Framework analysis result types
+
+public record FrameworkAnalysisResultDto
+{
+    public required string Framework { get; init; }
+    public int TotalIssues { get; init; }
+    public int CriticalCount { get; init; }
+    public int HighCount { get; init; }
+    public int MediumCount { get; init; }
+    public List<FrameworkIssueDto> Issues { get; init; } = [];
+    public Dictionary<string, int> IssuesByType { get; init; } = [];
+}
+
+public record FrameworkIssueDto
+{
+    public required string IssueType { get; init; }
+    public required string Severity { get; init; }
+    public required string Message { get; init; }
+    public required string FilePath { get; init; }
+    public required int Line { get; init; }
+    public string? CweId { get; init; }
+    public string? SuggestedFix { get; init; }
+    public string? CodeSnippet { get; init; }
+}
+
+// Code quality result types
+
+public record CodeQualityResultDto
+{
+    public int TotalIssues { get; init; }
+    public List<CodeQualityIssueDto> Issues { get; init; } = [];
+    public List<MethodMetricsDto> MethodMetrics { get; init; } = [];
+    public Dictionary<string, int> IssuesByCategory { get; init; } = [];
+    public double AverageCognitiveComplexity { get; init; }
+    public int MethodsAboveThreshold { get; init; }
+}
+
+public record CodeQualityIssueDto
+{
+    public required string Category { get; init; }
+    public required string IssueType { get; init; }
+    public required string Severity { get; init; }
+    public required string Message { get; init; }
+    public required string FilePath { get; init; }
+    public required int Line { get; init; }
+    public string? Suggestion { get; init; }
+    public string? CweId { get; init; }
+}
+
+public record MethodMetricsDto
+{
+    public required string MethodName { get; init; }
+    public required string FilePath { get; init; }
+    public required int Line { get; init; }
+    public int LineCount { get; init; }
+    public int ParameterCount { get; init; }
+    public int NestingDepth { get; init; }
+    public int CognitiveComplexity { get; init; }
+    public int CyclomaticComplexity { get; init; }
+    public int LocalVariableCount { get; init; }
+}
+
+// Virtual workspace comparison result
+
+public record TransformationComparisonResultDto
+{
+    public required string OriginalFilePath { get; init; }
+    public List<TransformationBranchResultDto> Results { get; init; } = [];
+    public TransformationBranchResultDto? BestResult { get; init; }
+    public int TotalStrategiesApplied { get; init; }
+    public int FailedStrategies { get; init; }
+}
+
+public record TransformationBranchResultDto
+{
+    public required string StrategyName { get; init; }
+    public required string Category { get; init; }
+    public required string Description { get; init; }
+    public required double OverallScore { get; init; }
+    public double ComplexityDelta { get; init; }
+    public double CognitiveComplexityDelta { get; init; }
+    public int LocDelta { get; init; }
+    public double MaintainabilityDelta { get; init; }
+    public bool CompilationValid { get; init; }
+    public bool SemanticsPreserved { get; init; }
+    public string? UnifiedDiff { get; init; }
+    public int AddedLines { get; init; }
+    public int RemovedLines { get; init; }
+    public string? Error { get; init; }
+}

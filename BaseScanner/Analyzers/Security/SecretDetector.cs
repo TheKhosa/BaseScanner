@@ -17,7 +17,7 @@ public class SecretDetector : ISecurityDetector
     {
         // API Keys
         new("AWS Access Key", @"AKIA[0-9A-Z]{16}", "CWE-798", "Critical"),
-        new("AWS Secret Key", @"(?i)aws(.{0,20})?['\"][0-9a-zA-Z/+]{40}['\"]", "CWE-798", "Critical"),
+        new("AWS Secret Key", @"(?i)aws(.{0,20})?['""][0-9a-zA-Z/+]{40}['""]", "CWE-798", "Critical"),
         new("Google API Key", @"AIza[0-9A-Za-z\-_]{35}", "CWE-798", "High"),
         new("Stripe API Key", @"(?:sk|pk)_(?:live|test)_[0-9a-zA-Z]{24}", "CWE-798", "Critical"),
         new("GitHub Token", @"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{36}", "CWE-798", "Critical"),

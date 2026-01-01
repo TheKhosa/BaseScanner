@@ -14,6 +14,7 @@ using BaseScanner.Analyzers.Security;
 using BaseScanner.Analysis;
 using BaseScanner.Services;
 using BaseScanner.Transformers;
+using BaseScanner.Transformers.Core;
 
 namespace BaseScanner;
 
@@ -66,6 +67,18 @@ class Program
             Console.WriteLine("  --rollback      Rollback to previous backup");
             Console.WriteLine("  --list-backups  List available transformation backups");
             Console.WriteLine();
+            Console.WriteLine("Refactoring Options:");
+            Console.WriteLine("  --refactor-analyze        Analyze refactoring opportunities with LCOM4");
+            Console.WriteLine("  --refactor-preview        Preview refactoring strategies for a target");
+            Console.WriteLine("  --refactor-apply          Apply best refactoring strategy");
+            Console.WriteLine("  --refactor-chain          Apply chain of strategies for god class remediation");
+            Console.WriteLine("  --file=X                  Target file path for refactoring");
+            Console.WriteLine("  --target=X                Target class/method name");
+            Console.WriteLine("  --strategy=X              Specific strategy: SimplifyMethod, ExtractMethod,");
+            Console.WriteLine("                            ExtractClass, SplitGodClass, ExtractInterface,");
+            Console.WriteLine("                            ReplaceConditional");
+            Console.WriteLine("  --chain-type=X            Chain type: godclass, longmethod, testability, complexity");
+            Console.WriteLine();
             Console.WriteLine("Server Mode:");
             Console.WriteLine("  --mcp           Run as MCP server for Claude Code integration");
             return 1;
@@ -91,6 +104,51 @@ class Program
             var category = GetArgValue(args, "--category") ?? "all";
             var confidence = GetArgValue(args, "--confidence") ?? "high";
             return await HandleTransformations(projectPath, isPreview, category, confidence);
+        }
+
+        // Handle refactoring commands
+        if (args.Contains("--refactor-analyze", StringComparer.OrdinalIgnoreCase))
+        {
+            var severity = GetArgValue(args, "--severity") ?? "medium";
+            return await HandleRefactorAnalyze(projectPath, severity);
+        }
+
+        if (args.Contains("--refactor-preview", StringComparer.OrdinalIgnoreCase))
+        {
+            var file = GetArgValue(args, "--file");
+            var target = GetArgValue(args, "--target");
+            if (string.IsNullOrEmpty(file) || string.IsNullOrEmpty(target))
+            {
+                Console.WriteLine("Error: --refactor-preview requires --file and --target");
+                return 1;
+            }
+            return await HandleRefactorPreview(projectPath, file, target);
+        }
+
+        if (args.Contains("--refactor-apply", StringComparer.OrdinalIgnoreCase))
+        {
+            var file = GetArgValue(args, "--file");
+            var target = GetArgValue(args, "--target");
+            var strategy = GetArgValue(args, "--strategy");
+            if (string.IsNullOrEmpty(file) || string.IsNullOrEmpty(target))
+            {
+                Console.WriteLine("Error: --refactor-apply requires --file and --target");
+                return 1;
+            }
+            return await HandleRefactorApply(projectPath, file, target, strategy);
+        }
+
+        if (args.Contains("--refactor-chain", StringComparer.OrdinalIgnoreCase))
+        {
+            var file = GetArgValue(args, "--file");
+            var target = GetArgValue(args, "--target");
+            var chainType = GetArgValue(args, "--chain-type") ?? "godclass";
+            if (string.IsNullOrEmpty(file) || string.IsNullOrEmpty(target))
+            {
+                Console.WriteLine("Error: --refactor-chain requires --file and --target");
+                return 1;
+            }
+            return await HandleRefactorChain(projectPath, file, target, chainType);
         }
 
         var options = new CliAnalysisOptions
@@ -210,8 +268,9 @@ class Program
         try
         {
             MSBuildLocator.RegisterDefaults();
-            var service = new TransformationService();
-            var result = await service.RollbackAsync(projectPath, null);
+            var backupService = new BackupService(projectPath);
+            var service = new TransformationService(backupService);
+            var result = await service.RollbackAsync(null);
 
             if (result.Success)
             {
@@ -223,7 +282,7 @@ class Program
             else
             {
                 Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"Rollback failed: {result.Message}");
+                Console.WriteLine($"Rollback failed: {result.ErrorMessage}");
                 Console.ResetColor();
                 return 1;
             }
@@ -252,12 +311,12 @@ class Program
 
             Console.WriteLine($"Available backups ({backups.Count}):");
             Console.WriteLine();
-            foreach (var backup in backups.OrderByDescending(b => b.Timestamp))
+            foreach (var backup in backups.OrderByDescending(b => b.CreatedAt))
             {
                 Console.ForegroundColor = ConsoleColor.Cyan;
-                Console.Write($"  {backup.BackupId}");
+                Console.Write($"  {backup.Id}");
                 Console.ResetColor();
-                Console.WriteLine($"  {backup.Timestamp:yyyy-MM-dd HH:mm:ss}  ({backup.FileCount} files)");
+                Console.WriteLine($"  {backup.CreatedAt:yyyy-MM-dd HH:mm:ss}  ({backup.FileCount} files)");
                 if (!string.IsNullOrEmpty(backup.Description))
                 {
                     Console.ForegroundColor = ConsoleColor.DarkGray;
@@ -289,16 +348,19 @@ class Program
                 MaxTransformations = 100
             };
 
-            var service = new TransformationService();
+            var analysisService = new AnalysisService();
+            var project = await analysisService.OpenProjectAsync(projectPath);
+            var backupService = new BackupService(projectPath);
+            var service = new TransformationService(backupService);
 
             if (isPreview)
             {
                 Console.WriteLine("Previewing transformations...");
                 Console.WriteLine();
 
-                var preview = await service.PreviewAsync(projectPath, filter);
+                var preview = await service.PreviewAsync(project, filter);
 
-                if (preview.FilteredCount == 0)
+                if (preview.Previews.Count == 0)
                 {
                     Console.ForegroundColor = ConsoleColor.Green;
                     Console.WriteLine("No transformations match the specified criteria.");
@@ -306,10 +368,10 @@ class Program
                     return 0;
                 }
 
-                Console.WriteLine($"Found {preview.TotalOpportunities} opportunities, {preview.FilteredCount} match filter:");
+                Console.WriteLine($"Found {preview.TotalTransformations} transformations:");
                 Console.WriteLine();
 
-                var grouped = preview.Transformations.GroupBy(t => t.Category);
+                var grouped = preview.Previews.GroupBy(t => t.Category);
                 foreach (var group in grouped)
                 {
                     Console.ForegroundColor = ConsoleColor.Cyan;
@@ -330,10 +392,10 @@ class Program
                         Console.ForegroundColor = confidenceColor;
                         Console.Write($"[{t.Confidence}] ");
                         Console.ResetColor();
-                        Console.WriteLine(t.Description);
+                        Console.WriteLine(t.TransformationType);
 
                         Console.ForegroundColor = ConsoleColor.DarkRed;
-                        Console.WriteLine($"      - {t.CurrentCode.Trim().Replace("\n", " ").Replace("\r", "")}");
+                        Console.WriteLine($"      - {t.OriginalCode.Trim().Replace("\n", " ").Replace("\r", "")}");
                         Console.ForegroundColor = ConsoleColor.DarkGreen;
                         Console.WriteLine($"      + {t.SuggestedCode.Trim().Replace("\n", " ").Replace("\r", "")}");
                         Console.ResetColor();
@@ -358,17 +420,15 @@ class Program
 
                 var options = new TransformationOptions
                 {
-                    CreateBackup = true,
-                    ValidateAfterTransform = true,
-                    StopOnFirstError = false
+                    FormatOutput = true
                 };
 
-                var result = await service.ApplyAsync(projectPath, filter, options);
+                var result = await service.ApplyAsync(project, filter, options);
 
                 if (result.Success)
                 {
                     Console.ForegroundColor = ConsoleColor.Green;
-                    Console.WriteLine($"Successfully applied {result.TransformationsApplied} transformations to {result.FilesModified} files.");
+                    Console.WriteLine($"Successfully applied {result.TotalTransformations} transformations to {result.FilesModified} files.");
                     Console.ResetColor();
 
                     if (!string.IsNullOrEmpty(result.BackupId))
@@ -380,17 +440,13 @@ class Program
                 else
                 {
                     Console.ForegroundColor = ConsoleColor.Yellow;
-                    Console.WriteLine($"Applied {result.TransformationsApplied} transformations, {result.TransformationsFailed} failed.");
+                    Console.WriteLine($"Transformations completed with issues.");
                     Console.ResetColor();
 
-                    if (result.Errors.Count > 0)
+                    if (!string.IsNullOrEmpty(result.ErrorMessage))
                     {
                         Console.ForegroundColor = ConsoleColor.Red;
-                        Console.WriteLine("Errors:");
-                        foreach (var error in result.Errors.Take(10))
-                        {
-                            Console.WriteLine($"  {error}");
-                        }
+                        Console.WriteLine($"Error: {result.ErrorMessage}");
                         Console.ResetColor();
                     }
                 }
@@ -1974,7 +2030,8 @@ class Program
         Console.WriteLine();
 
         var analyzer = new SecurityAnalyzer();
-        var vulnerabilities = await analyzer.AnalyzeAsync(project);
+        var securityResult = await analyzer.AnalyzeAsync(project);
+        var vulnerabilities = securityResult.Vulnerabilities;
 
         if (vulnerabilities.Count == 0)
         {
@@ -2053,7 +2110,7 @@ class Program
         Console.WriteLine();
 
         var dashboard = new MetricsDashboard();
-        var metrics = await dashboard.CalculateMetricsAsync(project);
+        var metrics = await dashboard.GenerateDashboardAsync(project);
 
         // Health Score
         var healthColor = metrics.HealthScore >= 80 ? ConsoleColor.Green : metrics.HealthScore >= 60 ? ConsoleColor.Yellow : ConsoleColor.Red;
@@ -2213,6 +2270,360 @@ class Program
             Console.ForegroundColor = ConsoleColor.Green;
             Console.WriteLine("  No regressions detected in recent history.");
             Console.ResetColor();
+        }
+    }
+
+    static async Task<int> HandleRefactorAnalyze(string projectPath, string severity)
+    {
+        try
+        {
+            AnalysisService.EnsureMSBuildRegistered();
+            Console.WriteLine("Analyzing refactoring opportunities...");
+            Console.WriteLine();
+
+            var service = new AnalysisService();
+            var project = await service.OpenProjectAsync(projectPath);
+
+            var workspaceManager = new VirtualWorkspace.VirtualWorkspaceManager();
+            var projectDir = Path.GetDirectoryName(project.FilePath) ?? Environment.CurrentDirectory;
+            var backupService = new BackupService(projectDir);
+            var orchestrator = new Refactoring.RefactoringOrchestrator(workspaceManager, backupService);
+
+            var options = new Refactoring.Models.RefactoringOptions
+            {
+                MinimumSeverity = severity.ToLowerInvariant() switch
+                {
+                    "critical" => Refactoring.Models.SmellSeverity.Critical,
+                    "high" => Refactoring.Models.SmellSeverity.High,
+                    "medium" => Refactoring.Models.SmellSeverity.Medium,
+                    _ => Refactoring.Models.SmellSeverity.Low
+                }
+            };
+
+            var plan = await orchestrator.AnalyzeRefactoringAsync(project, options);
+
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine($"REFACTORING OPPORTUNITIES: {plan.Summary.TotalOpportunities}");
+            Console.ResetColor();
+            Console.WriteLine();
+
+            if (plan.Summary.TotalOpportunities == 0)
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine("No significant refactoring opportunities found.");
+                Console.ResetColor();
+                return 0;
+            }
+
+            Console.WriteLine($"  Critical: {plan.Summary.CriticalCount}");
+            Console.WriteLine($"  High: {plan.Summary.HighCount}");
+            Console.WriteLine($"  Medium: {plan.Summary.MediumCount}");
+            Console.WriteLine($"  Low: {plan.Summary.LowCount}");
+            Console.WriteLine();
+
+            foreach (var opportunity in plan.Opportunities.Take(20))
+            {
+                var color = opportunity.Smell.Severity switch
+                {
+                    Refactoring.Models.SmellSeverity.Critical => ConsoleColor.Red,
+                    Refactoring.Models.SmellSeverity.High => ConsoleColor.Yellow,
+                    _ => ConsoleColor.White
+                };
+
+                Console.ForegroundColor = color;
+                Console.Write($"  [{opportunity.Smell.Severity}] ");
+                Console.ResetColor();
+                Console.WriteLine($"{opportunity.Smell.TargetName} ({opportunity.Smell.SmellType})");
+
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine($"    {Path.GetFileName(opportunity.Smell.FilePath)}:{opportunity.Smell.StartLine}");
+                Console.WriteLine($"    {opportunity.Smell.Description}");
+                Console.Write($"    Strategies: ");
+                Console.ResetColor();
+                Console.WriteLine(string.Join(", ", opportunity.ApplicableStrategies));
+                Console.WriteLine();
+            }
+
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"Error: {ex.Message}");
+            Console.WriteLine(ex.StackTrace);
+            Console.ResetColor();
+            return 1;
+        }
+    }
+
+    static async Task<int> HandleRefactorPreview(string projectPath, string filePath, string target)
+    {
+        try
+        {
+            AnalysisService.EnsureMSBuildRegistered();
+            Console.WriteLine($"Previewing refactoring strategies for {target}...");
+            Console.WriteLine();
+
+            var service = new AnalysisService();
+            var project = await service.OpenProjectAsync(projectPath);
+
+            var document = project.Documents.FirstOrDefault(d =>
+                d.FilePath?.EndsWith(filePath, StringComparison.OrdinalIgnoreCase) == true ||
+                d.FilePath == filePath);
+
+            if (document == null)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"File not found: {filePath}");
+                Console.ResetColor();
+                return 1;
+            }
+
+            var workspaceManager = new VirtualWorkspace.VirtualWorkspaceManager();
+            var projectDir = Path.GetDirectoryName(project.FilePath) ?? Environment.CurrentDirectory;
+            var backupService = new BackupService(projectDir);
+            var orchestrator = new Refactoring.RefactoringOrchestrator(workspaceManager, backupService);
+            var cohesionAnalyzer = new Refactoring.Analysis.CohesionAnalyzer();
+
+            var smells = await cohesionAnalyzer.DetectCohesionSmellsAsync(document);
+            var targetSmell = smells.FirstOrDefault(s => s.TargetName == target) ?? new Refactoring.Models.CodeSmell
+            {
+                SmellType = Refactoring.Models.CodeSmellType.GodClass,
+                Severity = Refactoring.Models.SmellSeverity.High,
+                FilePath = document.FilePath ?? "",
+                StartLine = 1,
+                EndLine = 1,
+                TargetName = target,
+                Description = $"Manual refactoring target: {target}"
+            };
+
+            var opportunity = new Refactoring.Models.RefactoringOpportunity
+            {
+                Smell = targetSmell,
+                DocumentId = document.Id,
+                ApplicableStrategies = Enum.GetValues<Refactoring.Models.RefactoringType>().ToList(),
+                EstimatedComplexityReduction = 0,
+                EstimatedCohesionImprovement = 0,
+                Recommendation = ""
+            };
+
+            var comparison = await orchestrator.CompareStrategiesAsync(project, opportunity);
+
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine($"STRATEGY COMPARISON: {comparison.Results.Count} strategies tested");
+            Console.ResetColor();
+            Console.WriteLine();
+
+            foreach (var result in comparison.Results.OrderByDescending(r => r.Score.OverallRefactoringScore))
+            {
+                var scoreColor = result.Score.OverallRefactoringScore > 50 ? ConsoleColor.Green :
+                                 result.Score.OverallRefactoringScore > 0 ? ConsoleColor.Yellow : ConsoleColor.Red;
+
+                Console.ForegroundColor = scoreColor;
+                Console.Write($"  [{result.Score.OverallRefactoringScore:F1}] ");
+                Console.ResetColor();
+                Console.WriteLine($"{result.StrategyName}");
+
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine($"    {result.Description}");
+                Console.WriteLine($"    Cohesion: {result.Score.CohesionImprovement:+0.0;-0.0;0}  Complexity: {result.Score.BaseScore.ComplexityDelta:+0;-0;0}  LOC: {result.Score.BaseScore.LocDelta:+0;-0;0}");
+                Console.WriteLine($"    Lines: +{result.Diff.AddedLines} -{result.Diff.RemovedLines}");
+                Console.ResetColor();
+                Console.WriteLine();
+            }
+
+            if (comparison.BestResult != null)
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"Recommended: {comparison.BestResult.StrategyName} (score: {comparison.BestResult.Score.OverallRefactoringScore:F1})");
+                Console.ResetColor();
+                Console.WriteLine();
+                Console.WriteLine($"Run with --refactor-apply --file=\"{filePath}\" --target=\"{target}\" to apply");
+            }
+
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"Error: {ex.Message}");
+            Console.ResetColor();
+            return 1;
+        }
+    }
+
+    static async Task<int> HandleRefactorApply(string projectPath, string filePath, string target, string? strategy)
+    {
+        try
+        {
+            AnalysisService.EnsureMSBuildRegistered();
+            Console.WriteLine($"Applying refactoring to {target}...");
+            Console.WriteLine();
+
+            var service = new AnalysisService();
+            var project = await service.OpenProjectAsync(projectPath);
+
+            var document = project.Documents.FirstOrDefault(d =>
+                d.FilePath?.EndsWith(filePath, StringComparison.OrdinalIgnoreCase) == true ||
+                d.FilePath == filePath);
+
+            if (document == null)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"File not found: {filePath}");
+                Console.ResetColor();
+                return 1;
+            }
+
+            var workspaceManager = new VirtualWorkspace.VirtualWorkspaceManager();
+            var projectDir = Path.GetDirectoryName(project.FilePath) ?? Environment.CurrentDirectory;
+            var backupService = new BackupService(projectDir);
+            var orchestrator = new Refactoring.RefactoringOrchestrator(workspaceManager, backupService);
+            var cohesionAnalyzer = new Refactoring.Analysis.CohesionAnalyzer();
+
+            var smells = await cohesionAnalyzer.DetectCohesionSmellsAsync(document);
+            var targetSmell = smells.FirstOrDefault(s => s.TargetName == target) ?? new Refactoring.Models.CodeSmell
+            {
+                SmellType = Refactoring.Models.CodeSmellType.GodClass,
+                Severity = Refactoring.Models.SmellSeverity.High,
+                FilePath = document.FilePath ?? "",
+                StartLine = 1,
+                EndLine = 1,
+                TargetName = target,
+                Description = $"Manual refactoring target: {target}"
+            };
+
+            var applicableStrategies = strategy != null
+                ? new List<Refactoring.Models.RefactoringType> { Enum.Parse<Refactoring.Models.RefactoringType>(strategy, ignoreCase: true) }
+                : Enum.GetValues<Refactoring.Models.RefactoringType>().ToList();
+
+            var opportunity = new Refactoring.Models.RefactoringOpportunity
+            {
+                Smell = targetSmell,
+                DocumentId = document.Id,
+                ApplicableStrategies = applicableStrategies,
+                EstimatedComplexityReduction = 0,
+                EstimatedCohesionImprovement = 0,
+                Recommendation = ""
+            };
+
+            var comparison = await orchestrator.CompareStrategiesAsync(project, opportunity);
+            var result = await orchestrator.ApplyBestStrategyAsync(comparison);
+
+            if (result.Success)
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"Successfully applied {result.StrategyResult.StrategyName}");
+                Console.ResetColor();
+                Console.WriteLine($"  Score: {result.StrategyResult.Score.OverallRefactoringScore:F1}");
+                Console.WriteLine($"  Modified: {string.Join(", ", result.ModifiedFiles.Select(Path.GetFileName))}");
+
+                if (!string.IsNullOrEmpty(result.BackupId))
+                {
+                    Console.WriteLine($"  Backup: {result.BackupId}");
+                    Console.WriteLine("  Run with --rollback to undo changes.");
+                }
+            }
+            else
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"Refactoring failed: {result.Error}");
+                Console.ResetColor();
+            }
+
+            return result.Success ? 0 : 1;
+        }
+        catch (Exception ex)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"Error: {ex.Message}");
+            Console.ResetColor();
+            return 1;
+        }
+    }
+
+    static async Task<int> HandleRefactorChain(string projectPath, string filePath, string target, string chainType)
+    {
+        try
+        {
+            AnalysisService.EnsureMSBuildRegistered();
+            Console.WriteLine($"Applying refactoring chain ({chainType}) to {target}...");
+            Console.WriteLine();
+
+            var service = new AnalysisService();
+            var project = await service.OpenProjectAsync(projectPath);
+
+            var document = project.Documents.FirstOrDefault(d =>
+                d.FilePath?.EndsWith(filePath, StringComparison.OrdinalIgnoreCase) == true ||
+                d.FilePath == filePath);
+
+            if (document == null)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"File not found: {filePath}");
+                Console.ResetColor();
+                return 1;
+            }
+
+            var workspaceManager = new VirtualWorkspace.VirtualWorkspaceManager();
+            var projectDir = Path.GetDirectoryName(project.FilePath) ?? Environment.CurrentDirectory;
+            var backupService = new BackupService(projectDir);
+            var orchestrator = new Refactoring.RefactoringOrchestrator(workspaceManager, backupService);
+            var composer = new Refactoring.Composition.StrategyComposer();
+
+            var chain = chainType.ToLowerInvariant() switch
+            {
+                "godclass" => composer.ComposeForGodClass(),
+                "longmethod" => composer.ComposeForLongMethod(),
+                "testability" => composer.ComposeForTestability(),
+                "complexity" => composer.ComposeForComplexity(),
+                _ => composer.ComposeForGodClass()
+            };
+
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine($"Chain: {chain.Description}");
+            Console.WriteLine($"Steps: {string.Join(" -> ", chain.Strategies)}");
+            Console.ResetColor();
+            Console.WriteLine();
+
+            var result = await orchestrator.ApplyStrategyChainAsync(project, document.Id, chain);
+
+            if (result.Success)
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"Successfully completed {result.StepsCompleted}/{result.TotalSteps} steps");
+                Console.ResetColor();
+
+                if (result.FinalScore != null)
+                {
+                    Console.WriteLine($"  Final Score: {result.FinalScore.OverallRefactoringScore:F1}");
+                    Console.WriteLine($"  Cohesion Improvement: {result.FinalScore.CohesionImprovement:+0.0;-0.0;0}");
+                }
+
+                foreach (var step in result.StepResults)
+                {
+                    Console.ForegroundColor = step.Success ? ConsoleColor.Green : ConsoleColor.Red;
+                    Console.Write($"  [{(step.Success ? "OK" : "FAIL")}] ");
+                    Console.ResetColor();
+                    Console.WriteLine($"{step.StrategyResult.StrategyName}: {step.StrategyResult.Score.OverallRefactoringScore:F1}");
+                }
+            }
+            else
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"Chain stopped at step: {result.StoppedAtStep}");
+                Console.WriteLine($"Reason: {result.StopReason}");
+                Console.ResetColor();
+            }
+
+            return result.Success ? 0 : 1;
+        }
+        catch (Exception ex)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"Error: {ex.Message}");
+            Console.ResetColor();
+            return 1;
         }
     }
 
